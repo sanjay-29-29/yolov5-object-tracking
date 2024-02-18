@@ -1,4 +1,4 @@
-# for of yolov5-object-tracking
+# fork of yolov5-object-tracking
 
 ### New Features
 - YOLOv5 Object Tracking Using Sort Tracker

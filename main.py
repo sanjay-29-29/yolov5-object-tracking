@@ -3,15 +3,122 @@ import time
 import torch
 from sort import *
 from pathlib import Path
+import pathlib
 from models.common import DetectMultiBackend
 from utils.dataloaders import IMG_FORMATS, VID_FORMATS, LoadImages, LoadStreams
 from utils.general import LOGGER, check_img_size, increment_path, non_max_suppression, scale_coords
 from utils.torch_utils import select_device, time_sync
 from binary_classifier import BinaryClassifier
 
+from PIL import Image
+import easyocr
+import numpy as np
+import os
+import sys
+import glob
+import random
+import importlib.util
+from tensorflow.lite.python.interpreter import Interpreter
+from PIL import Image
+import matplotlib
+import matplotlib.pyplot as plt
+
+temp = pathlib.PosixPath
+pathlib.PosixPath = pathlib.WindowsPath
+
+from flask import Flask, Response
+
+app = Flask(__name__)
+
+def getLabel(image,interpreter):
+    # Load the license plate detection model
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    height = input_details[0]['shape'][1]
+    width = input_details[0]['shape'][2]
+    float_input = (input_details[0]['dtype'] == np.float32)
+    input_mean = 127.5
+    input_std = 127.5
+
+    # Load the labelmap
+    with open('labelmap.txt', 'r') as f:
+        labels = [line.strip() for line in f.readlines()]
+
+    # Initialize EasyOCR reader
+    reader = easyocr.Reader(['en'])
+
+    # Preprocess the image for inference
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image_resized = cv2.resize(image_rgb, (width, height))
+    input_data = np.expand_dims(image_resized, axis=0)
+    if float_input:
+        input_data = (np.float32(input_data) - input_mean) / input_std
+
+    interpreter.set_tensor(input_details[0]['index'], input_data)
+    interpreter.invoke()
+
+    # Get the output tensors
+    boxes = interpreter.get_tensor(output_details[1]['index'])[0]  # Bounding box coordinates
+    classes = interpreter.get_tensor(output_details[3]['index'])[0]  # Class index of detected objects
+    scores = interpreter.get_tensor(output_details[0]['index'])[0]  # Confidence of detected objects
+
+    license_plate_text = []
+
+    # Iterate through the detected objects
+    for i in range(len(scores)):
+        if ((scores[i] > 0.3) and (scores[i] <= 1.0)):
+            ymin = int(max(1, (boxes[i][0] * image.shape[0])))
+            xmin = int(max(1, (boxes[i][1] * image.shape[1])))
+            ymax = int(min(image.shape[0], (boxes[i][2] * image.shape[0])))
+            xmax = int(min(image.shape[1], (boxes[i][3] * image.shape[1])))
+
+            # Perform OCR on the detected region
+            cropped_img = image[ymin:ymax, xmin:xmax]  # Crop the detected region
+            ocr_result = reader.readtext(cropped_img)
+
+            # Filter OCR results
+            for result in ocr_result:
+                text = result[1]
+                license_plate_text.append(text)
+
+    return license_plate_text
+
 def save_snapshot(img, unique_id, frame_number):
-    cv2.imwrite(f"snapshot/snapshot_{unique_id}_{frame_number}.jpg", img)
+    path = os.getcwd() + f"\snapshot\snapshot_{unique_id}_{frame_number}.jpg"
+    cv2.imwrite(path, img)
     print(f"Snapshot captured for ID {unique_id} at frame {frame_number}")
+    return path
+
+import requests
+
+def send_snap(image_path,rn_no):
+    url = "http://52.66.168.66:4000/api/snap/upload"
+    files = {'snap': open(image_path, 'rb')}
+
+    try:
+        response = requests.post(url, files=files)
+        print("snap uploaded successfully!")
+        create_snap(snap_path=response.json()["snap_path"], station_name="bala_station", violation="helment", rn_no=rn_no)
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error sending snap: {e}")
+
+
+def create_snap(snap_path,station_name,violation,rn_no):
+    url = "http://52.66.168.66:4000/api/snap"
+    data = {
+        "device_name": station_name,
+        "stream": 6602,
+        "snap_path": snap_path,
+        "violation": violation,
+        "rn_no": rn_no
+    }
+    try:
+        response = requests.post(url, json=data)
+        print("snap created successfully!")
+    except requests.exceptions.RequestException as e:
+        print(f"Error sending snap: {e}")
+
 
 def is_helmet(model, frame, x1, y1, x2, y2):
     cropped_img = frame[y1:y2, x1:x2]
@@ -28,7 +135,7 @@ frame = 0
 unique_ids = {}
 min_appearances = 1
 
-def draw_boxes(img, bbox, identities=None, categories=None, names=None, roi_vertices=None, model=None, frame=frame):
+def draw_boxes(img, bbox, identities=None, categories=None, names=None, roi_vertices=None, model=None, frame=frame, interpreter=None):
     offset=(0, 0)
     for i, box in enumerate(bbox):
         x1, y1, x2, y2 = [int(i) for i in box]
@@ -48,10 +155,21 @@ def draw_boxes(img, bbox, identities=None, categories=None, names=None, roi_vert
             label = f"{label} {condition}"
             if id not in unique_ids:
                 unique_ids[id] = 0
+                if condition == "Helmet: False":
+                    rn_no = getLabel(img,interpreter=interpreter)
+                    print(rn_no)
+                    if len(rn_no) == 0:
+                        rn_no = "Not Clear"
+                    else:
+                        rn_no = rn_no[0]
+                    path = save_snapshot(img[y1:y2, x1:x2], id, frame)
+                    print(path)
+                    send_snap(image_path=path, rn_no=rn_no)
+
             unique_ids[id] += 1
 
-            if unique_ids[id] >= min_appearances and unique_ids[id] == 1:
-                save_snapshot(img[y1:y2, x1:x2], id, frame)
+            # if unique_ids[id] >= min_appearances and unique_ids[id] == 1:
+                # save_snapshot(img[y1:y2, x1:x2], id, frame)
 
         if roi_vertices is None or (
             cv2.pointPolygonTest(roi_vertices, (x1, y1), False) >= 0 and
@@ -73,6 +191,10 @@ def draw_boxes(img, bbox, identities=None, categories=None, names=None, roi_vert
     return img
     
 def detect():
+    print("Loading model")
+    model_path = 'detect.tflite'
+    interpreter = Interpreter(model_path=model_path)
+    interpreter.allocate_tensors()
     #............Initialization............#
     weights = 'weights/best_last.pt'
     source = 'videos/D303erer_20240216183826.mp4'
@@ -120,6 +242,7 @@ def detect():
         dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt)
     else:
         dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=pt)
+    print("video loaded")
     save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  
     (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True) 
     t0 = time.time()
@@ -178,7 +301,7 @@ def detect():
                     bbox_xyxy = tracked_dets[:,:4]
                     identities = tracked_dets[:, 8]
                     categories = tracked_dets[:, 4]
-                    draw_boxes(im0, bbox_xyxy, identities, categories, names, model=helmet_model,frame=frame)
+                    im0 = draw_boxes(im0, bbox_xyxy, identities, categories, names, model=helmet_model,frame=frame,interpreter=interpreter)
                 
                 frame+=1
 
@@ -186,11 +309,16 @@ def detect():
                 im0 = cv2.resize(im0,(1280,720))
                 cv2.imshow(str(p), im0)
                 cv2.waitKey(1) 
+            else:
+                ret, buffer = cv2.imencode('.jpg', im0)
+                frame = buffer.tobytes()
+                yield (b'--frame\r\n'
+                    b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
-            ret, buffer = cv2.imencode('.jpg', im0)
-            frame = buffer.tobytes()
-            yield (b'--frame\r\n'
-                b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+@app.route('/video_feed')
+def webcam_display():
+    return Response(detect(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
 
 if __name__ == "__main__":
-    detect()
+    app.run(debug=True)
